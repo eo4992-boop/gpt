@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,8 @@ class VideoInfo:
 
 def normalized_name(path: Path) -> str:
     text = path.stem.casefold()
+    # Windows Explorer numbered copies commonly use " (1)", " (2)", etc.
+    text = re.sub(r"\s*\(\d+\)\s*$", "", text)
     for char in "_-.()[]{}":
         text = text.replace(char, " ")
     return " ".join(text.split())

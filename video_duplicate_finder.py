@@ -124,12 +124,9 @@ def candidate_reason(a: VideoInfo, b: VideoInfo, filename_threshold: float) -> s
     same_size = a.size == b.size
     similarity = name_similarity(a.path, b.path)
 
-    # User rule: different size + unrelated filename is never compared further.
     if not same_size and similarity < filename_threshold:
         return None
 
-    # Same-size files can have completely different names. A partial hash is a cheap,
-    # strong confirmation before a full byte-for-byte hash is attempted.
     if same_size:
         try:
             if partial_hash(a.path) == partial_hash(b.path):
@@ -140,13 +137,12 @@ def candidate_reason(a: VideoInfo, b: VideoInfo, filename_threshold: float) -> s
             return f"파일 크기 동일 + 파일명 {similarity:.0f}% + 메타정보 유사"
         return None
 
-    # Different sizes are considered only when names are very similar.
     if metadata_similarity(a, b) >= 70:
         return f"파일 크기 다름 + 파일명 {similarity:.0f}% + 메타정보 유사"
     return None
 
 
-def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 90.0) -> list[list[VideoInfo]]:
+def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 85.0) -> list[list[VideoInfo]]:
     """Find duplicate candidates using the requested size/name rules."""
     groups: list[list[VideoInfo]] = []
     used: set[Path] = set()
@@ -155,8 +151,6 @@ def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 9
     for video in videos:
         size_buckets.setdefault(video.size, []).append(video)
 
-    # Same-size files: compare within each size bucket, so large scans avoid O(n²)
-    # comparisons across unrelated file sizes.
     for bucket in size_buckets.values():
         for index, first in enumerate(bucket):
             if first.path in used:
@@ -171,8 +165,6 @@ def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 9
                 groups.append(group)
                 used.update(item.path for item in group)
 
-    # Different-size candidates need a high filename similarity. This pass is kept
-    # separate because it is the user's explicit escape hatch for re-encoded copies.
     remaining = [video for video in videos if video.path not in used]
     for index, first in enumerate(remaining):
         if first.path in used:
@@ -246,7 +238,7 @@ class MainWindow(QMainWindow):
         self.recursive.setChecked(True)
         self.threshold = QSpinBox()
         self.threshold.setRange(50, 100)
-        self.threshold.setValue(90)
+        self.threshold.setValue(85)
         self.threshold.setSuffix(" %")
         controls.addWidget(self.add_button)
         controls.addWidget(self.remove_button)
@@ -410,26 +402,26 @@ def format_size(size: int) -> str:
     value = float(size)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
-            return f"{value:,.1f} {unit}"
+            return f"{value:.1f} {unit}"
         value /= 1024
-    return f"{value:,.1f} TB"
+    return f"{value:.1f} TB"
 
 
-def format_duration(seconds: float | None) -> str:
-    if seconds is None:
+def format_duration(duration: float | None) -> str:
+    if duration is None:
         return "-"
-    total = max(0, int(seconds))
+    total = max(0, int(duration))
     hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
 
-def main() -> None:
+def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

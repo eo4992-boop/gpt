@@ -8,7 +8,7 @@ def info(name: str, size: int, duration: float = 100.0) -> VideoInfo:
 
 
 def test_name_similarity_is_high_for_numbered_copy() -> None:
-    assert name_similarity(Path("holiday.mp4"), Path("holiday (1).mp4")) >= 90
+    assert name_similarity(Path("holiday.mp4"), Path("holiday (1).mp4")) >= 85
 
 
 def test_same_size_and_similar_name_are_grouped() -> None:
@@ -44,3 +44,11 @@ def test_different_size_highly_similar_name_and_metadata_are_grouped() -> None:
     ])
     assert len(groups) == 1
     assert {item.path.name for item in groups[0]} == {"holiday.mp4", "holiday_final.mp4"}
+
+
+def test_different_size_85_percent_name_threshold_is_used_by_default() -> None:
+    groups = find_duplicate_groups([
+        info("holiday.mp4", 1000, 100.0),
+        info("holiday (1).mp4", 2000, 100.5),
+    ])
+    assert len(groups) == 1

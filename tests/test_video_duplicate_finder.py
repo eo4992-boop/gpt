@@ -40,10 +40,10 @@ def test_different_size_with_unrelated_name_is_not_grouped() -> None:
 def test_different_size_highly_similar_name_and_metadata_are_grouped() -> None:
     groups = find_duplicate_groups([
         info("holiday.mp4", 1000, 100.0),
-        info("holiday_final.mp4", 2000, 100.5),
+        info("holiday (1).mp4", 2000, 100.5),
     ])
     assert len(groups) == 1
-    assert {item.path.name for item in groups[0]} == {"holiday.mp4", "holiday_final.mp4"}
+    assert {item.path.name for item in groups[0]} == {"holiday.mp4", "holiday (1).mp4"}
 
 
 def test_different_size_85_percent_name_threshold_is_used_by_default() -> None:

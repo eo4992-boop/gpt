@@ -21,9 +21,26 @@ def test_same_size_and_similar_name_are_grouped() -> None:
     assert {item.path.name for item in groups[0]} == {"holiday.mp4", "holiday (1).mp4"}
 
 
+def test_same_size_unrelated_name_is_not_grouped_without_matching_content() -> None:
+    groups = find_duplicate_groups([
+        info("holiday.mp4", 1000),
+        info("family-video.mp4", 1000),
+    ])
+    assert groups == []
+
+
 def test_different_size_with_unrelated_name_is_not_grouped() -> None:
     groups = find_duplicate_groups([
         info("holiday.mp4", 1000),
         info("family-video.mp4", 2000),
     ])
     assert groups == []
+
+
+def test_different_size_highly_similar_name_and_metadata_are_grouped() -> None:
+    groups = find_duplicate_groups([
+        info("holiday.mp4", 1000, 100.0),
+        info("holiday_final.mp4", 2000, 100.5),
+    ])
+    assert len(groups) == 1
+    assert {item.path.name for item in groups[0]} == {"holiday.mp4", "holiday_final.mp4"}

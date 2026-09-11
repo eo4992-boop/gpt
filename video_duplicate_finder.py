@@ -7,7 +7,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -16,7 +15,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -27,6 +25,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from send2trash import send2trash
 
 VIDEO_EXTENSIONS = {
     ".3g2", ".3gp", ".asf", ".avi", ".divx", ".flv", ".m2ts", ".m4v",
@@ -46,7 +45,6 @@ class VideoInfo:
 
 
 def normalized_name(path: Path) -> str:
-    """Normalize a filename for similarity comparison without losing useful words."""
     text = path.stem.casefold()
     for char in "_-.()[]{}":
         text = text.replace(char, " ")
@@ -58,11 +56,10 @@ def name_similarity(a: Path, b: Path) -> float:
 
 
 def partial_hash(path: Path, sample_size: int = 1024 * 1024) -> str:
-    """Hash the first and last sample_size bytes; useful as a cheap confirmation step."""
+    """Hash the beginning and end of a file without reading the whole video."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        first = handle.read(sample_size)
-        digest.update(first)
+        digest.update(handle.read(sample_size))
         if path.stat().st_size > sample_size:
             handle.seek(-sample_size, os.SEEK_END)
             digest.update(handle.read(sample_size))
@@ -70,7 +67,6 @@ def partial_hash(path: Path, sample_size: int = 1024 * 1024) -> str:
 
 
 def ffprobe_info(path: Path) -> VideoInfo:
-    """Read video metadata using ffprobe. If ffprobe is unavailable, return file-only info."""
     base = VideoInfo(path=path, size=path.stat().st_size)
     try:
         result = subprocess.run(
@@ -113,46 +109,84 @@ def ffprobe_info(path: Path) -> VideoInfo:
 
 
 def metadata_similarity(a: VideoInfo, b: VideoInfo) -> float:
-    """Return a 0-100 similarity score for available video metadata."""
     scores: list[float] = []
-    if a.size == b.size:
-        scores.append(100)
-    else:
-        ratio = min(a.size, b.size) / max(a.size, b.size)
-        scores.append(ratio * 100)
-
     if a.duration is not None and b.duration is not None:
-        diff = abs(a.duration - b.duration)
-        scores.append(max(0.0, 100.0 - min(diff / max(a.duration, b.duration, 1) * 100, 100)))
+        longest = max(a.duration, b.duration, 1.0)
+        scores.append(max(0.0, 100.0 - abs(a.duration - b.duration) / longest * 100.0))
     if a.width and b.width and a.height and b.height:
-        scores.append(100.0 if (a.width, a.height) == (b.width, b.height) else 50.0)
+        scores.append(100.0 if (a.width, a.height) == (b.width, b.height) else 0.0)
     if a.codec and b.codec:
-        scores.append(100.0 if a.codec == b.codec else 50.0)
-    return sum(scores) / len(scores)
+        scores.append(100.0 if a.codec == b.codec else 0.0)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def candidate_reason(a: VideoInfo, b: VideoInfo, filename_threshold: float) -> str | None:
+    same_size = a.size == b.size
+    similarity = name_similarity(a.path, b.path)
+
+    # User rule: different size + unrelated filename is never compared further.
+    if not same_size and similarity < filename_threshold:
+        return None
+
+    # Same-size files can have completely different names. A partial hash is a cheap,
+    # strong confirmation before a full byte-for-byte hash is attempted.
+    if same_size:
+        try:
+            if partial_hash(a.path) == partial_hash(b.path):
+                return "파일 크기 동일 + 부분 해시 일치"
+        except OSError:
+            pass
+        if similarity >= filename_threshold and metadata_similarity(a, b) >= 70:
+            return f"파일 크기 동일 + 파일명 {similarity:.0f}% + 메타정보 유사"
+        return None
+
+    # Different sizes are considered only when names are very similar.
+    if metadata_similarity(a, b) >= 70:
+        return f"파일 크기 다름 + 파일명 {similarity:.0f}% + 메타정보 유사"
+    return None
 
 
 def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 90.0) -> list[list[VideoInfo]]:
-    """Find conservative duplicate candidates using size and/or filename similarity."""
+    """Find duplicate candidates using the requested size/name rules."""
     groups: list[list[VideoInfo]] = []
     used: set[Path] = set()
+    size_buckets: dict[int, list[VideoInfo]] = {}
 
-    # Same-size files are cheap to compare. Different-size files are considered only
-    # when names are very similar, allowing resized/re-encoded copies to surface.
-    for index, first in enumerate(videos):
+    for video in videos:
+        size_buckets.setdefault(video.size, []).append(video)
+
+    # Same-size files: compare within each size bucket, so large scans avoid O(n²)
+    # comparisons across unrelated file sizes.
+    for bucket in size_buckets.values():
+        for index, first in enumerate(bucket):
+            if first.path in used:
+                continue
+            group = [first]
+            for second in bucket[index + 1 :]:
+                if second.path in used:
+                    continue
+                if candidate_reason(first, second, filename_threshold):
+                    group.append(second)
+            if len(group) > 1:
+                groups.append(group)
+                used.update(item.path for item in group)
+
+    # Different-size candidates need a high filename similarity. This pass is kept
+    # separate because it is the user's explicit escape hatch for re-encoded copies.
+    remaining = [video for video in videos if video.path not in used]
+    for index, first in enumerate(remaining):
         if first.path in used:
             continue
         group = [first]
-        for second in videos[index + 1 :]:
-            if second.path in used:
+        for second in remaining[index + 1 :]:
+            if second.path in used or first.size == second.size:
                 continue
-            similarity = name_similarity(first.path, second.path)
-            same_size = first.size == second.size
-            if similarity >= filename_threshold or (same_size and similarity >= 70.0):
-                if metadata_similarity(first, second) >= 70.0:
-                    group.append(second)
+            if candidate_reason(first, second, filename_threshold):
+                group.append(second)
         if len(group) > 1:
             groups.append(group)
             used.update(item.path for item in group)
+
     return groups
 
 
@@ -161,17 +195,19 @@ class ScanWorker(QThread):
     finished_scan = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, folders: list[Path], threshold: float) -> None:
+    def __init__(self, folders: list[Path], threshold: float, recursive: bool) -> None:
         super().__init__()
         self.folders = folders
         self.threshold = threshold
+        self.recursive = recursive
 
     def run(self) -> None:
         try:
             paths: list[Path] = []
             seen: set[Path] = set()
             for folder in self.folders:
-                for path in folder.rglob("*"):
+                iterator = folder.rglob("*") if self.recursive else folder.glob("*")
+                for path in iterator:
                     if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS:
                         resolved = path.resolve()
                         if resolved not in seen:
@@ -185,7 +221,7 @@ class ScanWorker(QThread):
                 self.progress.emit(int(index * 100 / total), path.name)
 
             self.finished_scan.emit(find_duplicate_groups(videos, self.threshold))
-        except Exception as exc:  # keep worker failures visible in the GUI
+        except Exception as exc:
             self.failed.emit(f"검색 중 오류가 발생했습니다: {exc}")
 
 
@@ -193,7 +229,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("영상 중복 파일 찾기")
-        self.resize(1050, 650)
+        self.resize(1120, 650)
         self.folders: list[Path] = []
         self.groups: list[list[VideoInfo]] = []
         self.worker: ScanWorker | None = None
@@ -204,7 +240,7 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.add_button = QPushButton("폴더 추가")
-        self.remove_button = QPushButton("폴더 제거")
+        self.remove_button = QPushButton("마지막 폴더 제거")
         self.scan_button = QPushButton("중복 검색")
         self.recursive = QCheckBox("하위 폴더 포함")
         self.recursive.setChecked(True)
@@ -221,13 +257,14 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.scan_button)
         layout.addLayout(controls)
 
-        self.folder_label = QLineEdit()
-        self.folder_label.setReadOnly(True)
-        self.folder_label.setPlaceholderText("검색할 폴더가 없습니다.")
+        self.folder_label = QLabel("검색할 폴더가 없습니다.")
+        self.folder_label.setWordWrap(True)
         layout.addWidget(self.folder_label)
 
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["선택", "중복 그룹", "파일명", "크기", "재생시간", "해상도", "경로"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels([
+            "선택", "그룹", "파일명", "크기", "재생시간", "해상도", "판정", "경로",
+        ])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -237,7 +274,7 @@ class MainWindow(QMainWindow):
         self.status = QLabel("검색할 폴더를 추가하세요.")
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        self.delete_button = QPushButton("선택 파일 삭제")
+        self.delete_button = QPushButton("선택 파일 휴지통으로 이동")
         self.open_button = QPushButton("탐색기에서 열기")
         bottom.addWidget(self.status)
         bottom.addWidget(self.progress)
@@ -252,21 +289,26 @@ class MainWindow(QMainWindow):
         self.delete_button.clicked.connect(self.delete_selected)
         self.open_button.clicked.connect(self.open_selected)
 
+    def update_folder_label(self) -> None:
+        if self.folders:
+            self.folder_label.setText(" | ".join(str(item) for item in self.folders))
+        else:
+            self.folder_label.setText("검색할 폴더가 없습니다.")
+
     def add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "검색할 폴더 선택")
         if folder:
             path = Path(folder).resolve()
             if path not in self.folders:
                 self.folders.append(path)
-                self.folder_label.setText(" | ".join(str(item) for item in self.folders))
+                self.update_folder_label()
                 self.status.setText(f"폴더 {len(self.folders)}개 선택됨")
 
     def remove_folder(self) -> None:
-        if not self.folders:
-            return
-        self.folders.pop()
-        self.folder_label.setText(" | ".join(str(item) for item in self.folders))
-        self.status.setText(f"폴더 {len(self.folders)}개 선택됨")
+        if self.folders:
+            self.folders.pop()
+            self.update_folder_label()
+            self.status.setText(f"폴더 {len(self.folders)}개 선택됨")
 
     def start_scan(self) -> None:
         if not self.folders:
@@ -277,8 +319,14 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status.setText("영상 파일을 검색하는 중...")
         self.table.setRowCount(0)
-        self.worker = ScanWorker(self.folders.copy(), float(self.threshold.value()))
-        self.worker.progress.connect(lambda value, name: (self.progress.setValue(value), self.status.setText(f"메타정보 확인: {name}")))
+        self.worker = ScanWorker(
+            self.folders.copy(), float(self.threshold.value()), self.recursive.isChecked()
+        )
+        self.worker.progress.connect(
+            lambda value, name: (
+                self.progress.setValue(value), self.status.setText(f"메타정보 확인: {name}")
+            )
+        )
         self.worker.finished_scan.connect(self.scan_finished)
         self.worker.failed.connect(self.scan_failed)
         self.worker.start()
@@ -287,6 +335,7 @@ class MainWindow(QMainWindow):
         self.groups = groups
         self.table.setRowCount(0)
         for group_index, group in enumerate(groups, 1):
+            first = group[0]
             for info in group:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
@@ -298,11 +347,14 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, 4, QTableWidgetItem(format_duration(info.duration)))
                 resolution = f"{info.width}×{info.height}" if info.width and info.height else "-"
                 self.table.setItem(row, 5, QTableWidgetItem(resolution))
-                self.table.setItem(row, 6, QTableWidgetItem(str(info.path)))
+                reason = candidate_reason(first, info, float(self.threshold.value())) if info is not first else "기준 파일"
+                self.table.setItem(row, 6, QTableWidgetItem(reason or "중복 후보"))
+                self.table.setItem(row, 7, QTableWidgetItem(str(info.path)))
                 self.table.item(row, 2).setToolTip(str(info.path))
         self.scan_button.setEnabled(True)
         self.progress.setVisible(False)
-        self.status.setText(f"검색 완료: 중복 후보 {len(groups)}그룹 / {sum(len(g) for g in groups)}개 파일")
+        count = sum(len(group) for group in groups)
+        self.status.setText(f"검색 완료: 중복 후보 {len(groups)}그룹 / {count}개 파일")
 
     def scan_failed(self, message: str) -> None:
         self.scan_button.setEnabled(True)
@@ -315,7 +367,7 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount()):
             widget = self.table.cellWidget(row, 0)
             if isinstance(widget, QCheckBox) and widget.isChecked():
-                paths.append(Path(self.table.item(row, 6).text()))
+                paths.append(Path(self.table.item(row, 7).text()))
         return paths
 
     def delete_selected(self) -> None:
@@ -324,18 +376,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "선택 없음", "삭제할 파일을 선택하세요.")
             return
         answer = QMessageBox.warning(
-            self, "파일 삭제 확인",
-            f"선택한 {len(paths)}개 파일을 휴지통으로 보내지 않고 영구 삭제합니다. 계속할까요?",
+            self,
+            "파일 삭제 확인",
+            f"선택한 {len(paths)}개 파일을 Windows 휴지통으로 이동합니다. 계속할까요?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
+        failures: list[str] = []
         for path in paths:
             try:
-                path.unlink()
+                send2trash(str(path))
             except OSError as exc:
-                QMessageBox.warning(self, "삭제 실패", f"{path}\n{exc}")
+                failures.append(f"{path}\n{exc}")
+        if failures:
+            QMessageBox.warning(self, "일부 삭제 실패", "\n\n".join(failures[:5]))
         self.start_scan()
 
     def open_selected(self) -> None:

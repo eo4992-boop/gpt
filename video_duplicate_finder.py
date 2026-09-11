@@ -1,29 +1,16 @@
 from __future__ import annotations
 
 import difflib
-import hashlib
-import os
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QFileDialog,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from send2trash import send2trash
 
@@ -38,10 +25,6 @@ VIDEO_EXTENSIONS = {
 class VideoInfo:
     path: Path
     size: int
-    duration: float | None = None
-    width: int | None = None
-    height: int | None = None
-    codec: str | None = None
 
 
 def normalized_name(path: Path) -> str:
@@ -55,130 +38,27 @@ def name_similarity(a: Path, b: Path) -> float:
     return difflib.SequenceMatcher(None, normalized_name(a), normalized_name(b)).ratio() * 100
 
 
-def partial_hash(path: Path, sample_size: int = 1024 * 1024) -> str:
-    """Hash the beginning and end of a file without reading the whole video."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        digest.update(handle.read(sample_size))
-        if path.stat().st_size > sample_size:
-            handle.seek(-sample_size, os.SEEK_END)
-            digest.update(handle.read(sample_size))
-    return digest.hexdigest()
-
-
-def ffprobe_info(path: Path) -> VideoInfo:
-    base = VideoInfo(path=path, size=path.stat().st_size)
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,codec_name,duration",
-                "-of", "default=noprint_wrappers=1:nokey=0", str(path),
-            ],
-            capture_output=True, text=True, timeout=15, check=True,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError, OSError):
-        return base
-
-    values: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
-
-    def integer(key: str) -> int | None:
-        try:
-            return int(values[key])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    def number(key: str) -> float | None:
-        try:
-            return float(values[key])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    return VideoInfo(
-        path=path,
-        size=base.size,
-        duration=number("duration"),
-        width=integer("width"),
-        height=integer("height"),
-        codec=values.get("codec_name"),
-    )
-
-
-def metadata_similarity(a: VideoInfo, b: VideoInfo) -> float:
-    scores: list[float] = []
-    if a.duration is not None and b.duration is not None:
-        longest = max(a.duration, b.duration, 1.0)
-        scores.append(max(0.0, 100.0 - abs(a.duration - b.duration) / longest * 100.0))
-    if a.width and b.width and a.height and b.height:
-        scores.append(100.0 if (a.width, a.height) == (b.width, b.height) else 0.0)
-    if a.codec and b.codec:
-        scores.append(100.0 if a.codec == b.codec else 0.0)
-    return sum(scores) / len(scores) if scores else 0.0
-
-
-def candidate_reason(a: VideoInfo, b: VideoInfo, filename_threshold: float) -> str | None:
-    same_size = a.size == b.size
+def candidate_reason(a: VideoInfo, b: VideoInfo, threshold: float) -> str | None:
     similarity = name_similarity(a.path, b.path)
-
-    if not same_size and similarity < filename_threshold:
+    if similarity < threshold:
         return None
-
-    if same_size:
-        try:
-            if partial_hash(a.path) == partial_hash(b.path):
-                return "파일 크기 동일 + 부분 해시 일치"
-        except OSError:
-            pass
-        if similarity >= filename_threshold and metadata_similarity(a, b) >= 70:
-            return f"파일 크기 동일 + 파일명 {similarity:.0f}% + 메타정보 유사"
-        return None
-
-    if metadata_similarity(a, b) >= 70:
-        return f"파일 크기 다름 + 파일명 {similarity:.0f}% + 메타정보 유사"
-    return None
+    size_text = "동일" if a.size == b.size else "다름"
+    return f"파일 크기 {size_text} + 파일명 {similarity:.0f}%"
 
 
-def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 85.0) -> list[list[VideoInfo]]:
-    """Find duplicate candidates using the requested size/name rules."""
+def find_duplicate_groups(videos: list[VideoInfo], filename_threshold: float = 90.0) -> list[list[VideoInfo]]:
     groups: list[list[VideoInfo]] = []
     used: set[Path] = set()
-    size_buckets: dict[int, list[VideoInfo]] = {}
-
-    for video in videos:
-        size_buckets.setdefault(video.size, []).append(video)
-
-    for bucket in size_buckets.values():
-        for index, first in enumerate(bucket):
-            if first.path in used:
-                continue
-            group = [first]
-            for second in bucket[index + 1 :]:
-                if second.path in used:
-                    continue
-                if candidate_reason(first, second, filename_threshold):
-                    group.append(second)
-            if len(group) > 1:
-                groups.append(group)
-                used.update(item.path for item in group)
-
-    remaining = [video for video in videos if video.path not in used]
-    for index, first in enumerate(remaining):
+    for index, first in enumerate(videos):
         if first.path in used:
             continue
         group = [first]
-        for second in remaining[index + 1 :]:
-            if second.path in used or first.size == second.size:
-                continue
-            if candidate_reason(first, second, filename_threshold):
+        for second in videos[index + 1:]:
+            if second.path not in used and candidate_reason(first, second, filename_threshold):
                 group.append(second)
         if len(group) > 1:
             groups.append(group)
             used.update(item.path for item in group)
-
     return groups
 
 
@@ -189,9 +69,7 @@ class ScanWorker(QThread):
 
     def __init__(self, folders: list[Path], threshold: float, recursive: bool) -> None:
         super().__init__()
-        self.folders = folders
-        self.threshold = threshold
-        self.recursive = recursive
+        self.folders, self.threshold, self.recursive = folders, threshold, recursive
 
     def run(self) -> None:
         try:
@@ -205,13 +83,11 @@ class ScanWorker(QThread):
                         if resolved not in seen:
                             seen.add(resolved)
                             paths.append(resolved)
-
             total = max(len(paths), 1)
             videos: list[VideoInfo] = []
             for index, path in enumerate(paths, 1):
-                videos.append(ffprobe_info(path))
+                videos.append(VideoInfo(path, path.stat().st_size))
                 self.progress.emit(int(index * 100 / total), path.name)
-
             self.finished_scan.emit(find_duplicate_groups(videos, self.threshold))
         except Exception as exc:
             self.failed.emit(f"검색 중 오류가 발생했습니다: {exc}")
@@ -238,7 +114,7 @@ class MainWindow(QMainWindow):
         self.recursive.setChecked(True)
         self.threshold = QSpinBox()
         self.threshold.setRange(50, 100)
-        self.threshold.setValue(85)
+        self.threshold.setValue(90)
         self.threshold.setSuffix(" %")
         controls.addWidget(self.add_button)
         controls.addWidget(self.remove_button)
@@ -253,10 +129,8 @@ class MainWindow(QMainWindow):
         self.folder_label.setWordWrap(True)
         layout.addWidget(self.folder_label)
 
-        self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels([
-            "선택", "그룹", "파일명", "크기", "재생시간", "해상도", "판정", "경로",
-        ])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["선택", "그룹", "파일명", "크기", "판정", "경로"])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -316,7 +190,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.progress.connect(
             lambda value, name: (
-                self.progress.setValue(value), self.status.setText(f"메타정보 확인: {name}")
+                self.progress.setValue(value), self.status.setText(f"파일 확인: {name}")
             )
         )
         self.worker.finished_scan.connect(self.scan_finished)
@@ -331,17 +205,13 @@ class MainWindow(QMainWindow):
             for info in group:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
-                check = QCheckBox()
-                self.table.setCellWidget(row, 0, check)
+                self.table.setCellWidget(row, 0, QCheckBox())
                 self.table.setItem(row, 1, QTableWidgetItem(str(group_index)))
                 self.table.setItem(row, 2, QTableWidgetItem(info.path.name))
                 self.table.setItem(row, 3, QTableWidgetItem(format_size(info.size)))
-                self.table.setItem(row, 4, QTableWidgetItem(format_duration(info.duration)))
-                resolution = f"{info.width}×{info.height}" if info.width and info.height else "-"
-                self.table.setItem(row, 5, QTableWidgetItem(resolution))
                 reason = candidate_reason(first, info, float(self.threshold.value())) if info is not first else "기준 파일"
-                self.table.setItem(row, 6, QTableWidgetItem(reason or "중복 후보"))
-                self.table.setItem(row, 7, QTableWidgetItem(str(info.path)))
+                self.table.setItem(row, 4, QTableWidgetItem(reason or "중복 후보"))
+                self.table.setItem(row, 5, QTableWidgetItem(str(info.path)))
                 self.table.item(row, 2).setToolTip(str(info.path))
         self.scan_button.setEnabled(True)
         self.progress.setVisible(False)
@@ -359,7 +229,7 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount()):
             widget = self.table.cellWidget(row, 0)
             if isinstance(widget, QCheckBox) and widget.isChecked():
-                paths.append(Path(self.table.item(row, 7).text()))
+                paths.append(Path(self.table.item(row, 5).text()))
         return paths
 
     def delete_selected(self) -> None:
@@ -391,11 +261,7 @@ class MainWindow(QMainWindow):
         if not paths:
             QMessageBox.information(self, "선택 없음", "탐색기에서 열 파일을 선택하세요.")
             return
-        path = paths[0]
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", "/select,", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path.parent)])
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(paths[0].parent)))
 
 
 def format_size(size: int) -> str:
@@ -405,15 +271,6 @@ def format_size(size: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} TB"
-
-
-def format_duration(duration: float | None) -> str:
-    if duration is None:
-        return "-"
-    total = max(0, int(duration))
-    hours, remainder = divmod(total, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
 
 def main() -> int:

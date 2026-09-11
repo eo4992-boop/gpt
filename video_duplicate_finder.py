@@ -73,7 +73,7 @@ def candidate_reason(a: VideoInfo, b: VideoInfo, threshold: float) -> str | None
 
 
 def find_duplicate_groups(
-    videos: list[VideoInfo], filename_threshold: float = 90.0
+    videos: list[VideoInfo], filename_threshold: float = 80.0
 ) -> list[list[VideoInfo]]:
     # Build connected components of the candidate graph instead of anchoring
     # every group to its first file. This preserves A-B and B-C relationships
@@ -159,7 +159,7 @@ class MainWindow(QMainWindow):
         self.recursive.setChecked(True)
         self.threshold = QSpinBox()
         self.threshold.setRange(50, 100)
-        self.threshold.setValue(90)
+        self.threshold.setValue(80)
         self.threshold.setSuffix(" %")
         controls.addWidget(self.add_button)
         controls.addWidget(self.remove_button)
@@ -291,10 +291,28 @@ class MainWindow(QMainWindow):
     def _keeper_paths(self) -> set[Path]:
         return {group[0].path for group in self.groups if group}
 
+    def _groups_without_keeper(self, selected_paths: list[Path]) -> list[list[VideoInfo]]:
+        selected = set(selected_paths)
+        return [
+            group for group in self.groups
+            if group and all(info.path in selected for info in group)
+        ]
+
     def delete_selected(self) -> None:
         paths = self.selected_paths()
         if not paths:
             QMessageBox.information(self, "선택 없음", "삭제할 파일을 선택하세요.")
+            return
+
+        empty_groups = self._groups_without_keeper(paths)
+        if empty_groups:
+            QMessageBox.warning(
+                self,
+                "삭제 중단",
+                "후보 그룹의 모든 파일을 삭제하도록 선택했습니다.\n"
+                "각 그룹에서 최소 1개 파일은 남겨야 합니다.\n\n"
+                "삭제 체크를 조정한 뒤 다시 시도하세요.",
+            )
             return
 
         keeper_paths = self._keeper_paths()

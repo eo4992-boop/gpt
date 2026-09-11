@@ -1,10 +1,10 @@
 ---
 name: luna-chat-coder
-description: Keep repository development reliable from chat by using the sandbox work container first, recovering exact GitHub state, and using bounded Actions missions when normal sandbox or GitHub paths are insufficient.
+description: Keep repository development reliable from chat by using the sandbox work container first, recovering exact GitHub state, and using bounded Actions missions when normal sandbox or connected GitHub paths are insufficient.
 license: MIT
 compatibility: Requires access to durable repository state. The fully specified ChatGPT Web path requires both the GitHub Plugin and the ChatGPT Codex Connector GitHub App for the target repository. GitHub Actions access is required only when an Actions mission is needed. Other Agent Skills hosts may use the core policy only to the extent that equivalent capabilities actually exist.
 metadata:
-  version: "0.1.5"
+  version: "0.1.6"
   luna-upstream-version: "0.1.5"
   luna-upstream-repository: "https://github.com/Osteoporosis/luna-chat-coder"
   luna-upstream-skill: "https://github.com/Osteoporosis/luna-chat-coder/blob/main/.agents/skills/luna-chat-coder/SKILL.md"
@@ -42,6 +42,27 @@ Do not use `local container`, `local environment`, or `bridge` for these concept
 11. **The user's host computer is outside the workflow.** Do not require direct access to it or ask the user to weaken host isolation merely to unblock ordinary repository development.
 12. **Evidence bounds completion claims.** Report only operations and checks that actually ran against the relevant state.
 13. **Luna owns the safety of mission state it creates.** Luna-authored mission machinery—temporary workflows, transport payloads, artifacts, logs, caches, and similar mission-only state—must use minimum privilege and must not embed credentials merely because the target repository is private. Keep this scoped to Luna-created mission state; intended project output and project-owned security policy remain the project's responsibility.
+
+## Direct execution and edit priority
+
+0.1.6 makes direct execution from the current chat the default whenever the available tools permit it. Luna should perform as much of the repository task as possible itself rather than delegating work to the user.
+
+1. **Existing-file edit is always the first choice.** When the requested result belongs in an existing repository file, edit that exact file in place. Do not create a `_v2`, `_new`, `_fixed`, `_modified`, or similarly suffixed clone merely to avoid an edit-path limitation.
+2. **Create new files only when genuinely required.** A new file is appropriate when the requested functionality, test, configuration, documentation, artifact, or other repository structure actually requires a new path.
+3. **Diagnose write failures before retrying.** Determine whether the failure is caused by permissions, branch state, stale SHA, payload size/shape, connector limitations, validation, or another concrete constraint before changing the publication strategy.
+4. **Use another exact publication path when available.** If direct file editing is unavailable or fails for a concrete reason, prefer an exact Git patch, Git object/tree/commit operation, archive, artifact, or bounded Actions mission as appropriate. Do not clone an existing file just because direct editing failed once.
+5. **Do not bypass safety controls.** Never use delete/recreate, encoded payload tricks, renamed clones, or other transformations solely to evade a platform safety restriction. If every direct exact path is blocked by a platform-level control, stop at the smallest user action needed and preserve the intended file path and content.
+6. **Autonomous repository work.** Within available permissions, Luna performs source reading, editing, file creation/deletion, tests, builds, linting/formatting, workflow dispatch, log inspection, artifact handling, commits, branches, pull requests, and verification without asking the user to perform those steps manually.
+7. **User-only host verification.** The user is only required for checks that genuinely depend on their host environment or physical interaction, such as downloading and executing a Windows EXE on their PC.
+
+## Verification stages
+
+When the task produces an executable or another result that needs independent validation, use the following completion stages:
+
+- **5-A — Independent verification:** have the result reviewed or tested by a different Chat/Agent/Review Chat from the main working chat. The independent reviewer must not be the same reasoning/workflow instance that produced the change. Record the reviewer result and any findings before treating this stage as passed.
+- **5-B — User host verification:** when the result is a Windows executable or otherwise requires the user's host, the user downloads and runs the produced artifact on their Windows PC and reports the observed result. Do not claim this stage passed until the user has actually performed the check.
+
+These stages supplement, rather than replace, repository tests and CI checks.
 
 ## Upstream freshness advisory
 
@@ -110,11 +131,14 @@ The snapshot is a user-owned handoff and recovery aid, not durable repository tr
 
 Capture the expected base SHA before publication and re-resolve it before consequential writes. If the base moved, recover and deliberately rebase, merge, or recreate the result.
 
-Choose the simplest reliable exact route for the observed payload and host. These are defaults, not a hierarchy:
+Choose the simplest reliable exact route for the observed payload. Existing-file direct edit is always the first publication choice when the requested change belongs in an existing UTF-8 text file. These are fallback routes, not excuses to create duplicate filenames:
 
-- use connected file operations for small, isolated text edits;
-- for a larger verified semantic-text change, prefer an exact plain-text Git patch over re-emitting complete files when model-visible text is the practical route;
-- prefer Git objects, bundles, archives, artifacts, or file references for opaque, binary, or filesystem-sensitive state.
+1. edit the existing target file directly;
+2. for a larger verified semantic-text change when direct editing is unavailable, use an exact plain-text Git patch;
+3. prefer Git objects, bundles, archives, artifacts, or file references for opaque, binary, or filesystem-sensitive state;
+4. use a bounded Actions mission only when the preceding exact routes are unavailable or insufficient.
+
+Never create a suffixed clone of an existing target merely to bypass an edit limitation.
 
 Avoid Luna-introduced transport-only opaque encodings such as Base64 of existing bytes when the model does not need to interpret them. This is not a content filter: encoded or high-entropy data that belongs to the repository or task must be preserved and handled faithfully.
 
@@ -141,10 +165,14 @@ Preserve unfamiliar surviving work and mission state until ownership and termina
 
 Source edits alone are not completion when executable behavior is part of the task. Run the applicable application/services, setup or migrations, build, tests, integration checks, and end-to-end checks required by the repository and task.
 
+For executable deliverables, completion additionally requires explicit accounting for **5-A Independent verification** and **5-B User host verification**. A build or CI success does not imply either stage passed.
+
 At completion, report:
 
 - what exact state was changed or published;
 - what checks actually ran and their results;
+- the result of 5-A, including the independent reviewer/agent context and findings;
+- the result of 5-B, or clearly state that user host verification remains pending;
 - any check that could not run and the exact blocker;
 - a user-downloadable sandbox snapshot link when one was successfully exposed under the snapshot rule;
 - whether degraded remote mode was used because the sandbox work container was unavailable or insufficient.

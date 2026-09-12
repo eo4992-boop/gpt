@@ -354,6 +354,16 @@ class MainWindow(QMainWindow):
         selected = set(selected_paths)
         return [group for group in self.groups if group and all(info.path in selected for info in group)]
 
+    def _remove_deleted_from_results(self, deleted_paths: set[Path]) -> None:
+        """Update the current snapshot without starting a new filesystem scan."""
+        remaining_groups: list[list[VideoInfo]] = []
+        for group in self.groups:
+            remaining = [info for info in group if info.path not in deleted_paths]
+            if len(remaining) >= 2:
+                remaining_groups.append(remaining)
+        self.groups = remaining_groups
+        self.scan_finished(remaining_groups)
+
     def delete_selected(self) -> None:
         paths = self.selected_paths()
         if not paths:
@@ -396,15 +406,17 @@ class MainWindow(QMainWindow):
             return
 
         failures: list[str] = []
+        deleted_paths: set[Path] = set()
         for path in paths:
             try:
                 send2trash(str(path))
+                deleted_paths.add(path)
             except OSError as exc:
                 failures.append(f"{path}\n{exc}")
         if failures:
             QMessageBox.warning(self, "일부 삭제 실패", "\n\n".join(failures[:5]))
-        if self.folders:
-            self.start_scan()
+        if deleted_paths:
+            self._remove_deleted_from_results(deleted_paths)
 
     def open_selected(self) -> None:
         paths = self.selected_paths()

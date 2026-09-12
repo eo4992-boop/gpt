@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import difflib
+import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QThread, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from rapidfuzz import fuzz, process
 from send2trash import send2trash
 
 VIDEO_EXTENSIONS = {
@@ -41,7 +43,6 @@ class VideoInfo:
 
 def normalized_name(path: Path) -> str:
     text = path.stem.casefold()
-    # Windows Explorer numbered copies commonly use " (1)", " (2)", etc.
     text = re.sub(r"\s*\(\d+\)\s*$", "", text)
     for char in "_-.()[]{}":
         text = text.replace(char, " ")
@@ -49,7 +50,7 @@ def normalized_name(path: Path) -> str:
 
 
 def name_similarity(a: Path, b: Path) -> float:
-    return difflib.SequenceMatcher(None, normalized_name(a), normalized_name(b)).ratio() * 100
+    return fuzz.ratio(normalized_name(a), normalized_name(b))
 
 
 def _name_is_candidate(a: Path, b: Path, threshold: float) -> bool:
@@ -57,10 +58,7 @@ def _name_is_candidate(a: Path, b: Path, threshold: float) -> bool:
     right = normalized_name(b)
     if left == right:
         return True
-    matcher = difflib.SequenceMatcher(None, left, right, autojunk=False)
-    # quick_ratio() is an upper bound, so rejecting below the threshold cannot
-    # discard a pair that would pass the full SequenceMatcher ratio.
-    return matcher.quick_ratio() * 100 >= threshold and matcher.ratio() * 100 >= threshold
+    return fuzz.ratio(left, right, score_cutoff=threshold) >= threshold
 
 
 def candidate_reason(a: VideoInfo, b: VideoInfo, threshold: float) -> str | None:
@@ -73,22 +71,41 @@ def candidate_reason(a: VideoInfo, b: VideoInfo, threshold: float) -> str | None
 
 
 def find_duplicate_groups(
-    videos: list[VideoInfo], filename_threshold: float = 80.0
+    videos: list[VideoInfo],
+    filename_threshold: float = 80.0,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[list[VideoInfo]]:
-    # Build connected components of the candidate graph instead of anchoring
-    # every group to its first file. This preserves A-B and B-C relationships
-    # even when A-C falls below the similarity threshold.
+    """Build the candidate graph with the native RapidFuzz matcher.
+
+    Each pair is evaluated only once (against later items), while RapidFuzz
+    performs the expensive string work in optimized native code and can reject
+    below-threshold matches early. The graph semantics remain unchanged.
+    """
+    count = len(videos)
     adjacency: list[set[int]] = [set() for _ in videos]
-    for index, first in enumerate(videos):
-        for second_index in range(index + 1, len(videos)):
-            second = videos[second_index]
-            if candidate_reason(first, second, filename_threshold) is not None:
-                adjacency[index].add(second_index)
-                adjacency[second_index].add(index)
+    names = [normalized_name(video.path) for video in videos]
+
+    for index in range(count):
+        if index + 1 < count:
+            query = names[index]
+            choices = names[index + 1:]
+            for _, score, local_index in process.extract_iter(
+                query,
+                choices,
+                scorer=fuzz.ratio,
+                score_cutoff=filename_threshold,
+                score_hint=filename_threshold,
+            ):
+                second_index = index + 1 + local_index
+                if score >= filename_threshold:
+                    adjacency[index].add(second_index)
+                    adjacency[second_index].add(index)
+        if progress_callback is not None:
+            progress_callback(index + 1, count)
 
     groups: list[list[VideoInfo]] = []
     visited: set[int] = set()
-    for start in range(len(videos)):
+    for start in range(count):
         if start in visited or not adjacency[start]:
             continue
         stack = [start]
@@ -101,7 +118,6 @@ def find_duplicate_groups(
                 if neighbor not in visited:
                     visited.add(neighbor)
                     stack.append(neighbor)
-        # Put the largest file first as the non-destructive "keep" recommendation.
         indexes.sort(key=lambda item: (-videos[item].size, str(videos[item].path).casefold()))
         groups.append([videos[item] for item in indexes])
     return groups
@@ -120,20 +136,62 @@ class ScanWorker(QThread):
         try:
             paths: list[Path] = []
             seen: set[Path] = set()
+            discovered = 0
+
             for folder in self.folders:
-                iterator = folder.rglob("*") if self.recursive else folder.glob("*")
-                for path in iterator:
-                    if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS:
+                if self.recursive:
+                    walker = os.walk(folder)
+                    for root, _, filenames in walker:
+                        for filename in filenames:
+                            path = Path(root) / filename
+                            if path.suffix.casefold() not in VIDEO_EXTENSIONS:
+                                continue
+                            resolved = path.resolve()
+                            if resolved not in seen:
+                                seen.add(resolved)
+                                paths.append(resolved)
+                                discovered += 1
+                                if discovered == 1 or discovered % 25 == 0:
+                                    self.progress.emit(0, f"영상 파일 발견: {discovered}개")
+                else:
+                    for entry in os.scandir(folder):
+                        if not entry.is_file():
+                            continue
+                        path = Path(entry.path)
+                        if path.suffix.casefold() not in VIDEO_EXTENSIONS:
+                            continue
                         resolved = path.resolve()
                         if resolved not in seen:
                             seen.add(resolved)
                             paths.append(resolved)
-            total = max(len(paths), 1)
+                            discovered += 1
+                            if discovered == 1 or discovered % 25 == 0:
+                                self.progress.emit(0, f"영상 파일 발견: {discovered}개")
+
+            total = len(paths)
+            if not total:
+                self.progress.emit(100, "동영상 파일이 없습니다.")
+                self.finished_scan.emit([])
+                return
+
             videos: list[VideoInfo] = []
             for index, path in enumerate(paths, 1):
                 videos.append(VideoInfo(path, path.stat().st_size))
-                self.progress.emit(int(index * 100 / total), path.name)
-            self.finished_scan.emit(find_duplicate_groups(videos, self.threshold))
+                self.progress.emit(
+                    int(index * 35 / total),
+                    f"파일 정보 확인: {index}/{total} - {path.name}",
+                )
+
+            def report_compare(index: int, compare_total: int) -> None:
+                value = 35 + int(index * 65 / max(compare_total, 1))
+                self.progress.emit(value, f"중복 후보 분석: {index}/{compare_total}")
+
+            groups = find_duplicate_groups(
+                videos,
+                self.threshold,
+                progress_callback=report_compare,
+            )
+            self.finished_scan.emit(groups)
         except Exception as exc:
             self.failed.emit(f"검색 중 오류가 발생했습니다: {exc}")
 
@@ -227,6 +285,8 @@ class MainWindow(QMainWindow):
         if not self.folders:
             QMessageBox.information(self, "폴더 필요", "먼저 검색할 폴더를 하나 이상 추가하세요.")
             return
+        if self.worker is not None and self.worker.isRunning():
+            return
         self.scan_button.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setValue(0)
@@ -236,8 +296,8 @@ class MainWindow(QMainWindow):
             self.folders.copy(), float(self.threshold.value()), self.recursive.isChecked()
         )
         self.worker.progress.connect(
-            lambda value, name: (
-                self.progress.setValue(value), self.status.setText(f"파일 확인: {name}")
+            lambda value, message: (
+                self.progress.setValue(value), self.status.setText(message)
             )
         )
         self.worker.finished_scan.connect(self.scan_finished)
@@ -253,7 +313,6 @@ class MainWindow(QMainWindow):
                 row = self.table.rowCount()
                 self.table.insertRow(row)
                 delete_box = QCheckBox()
-                # Destructive action is opt-in. Nothing is preselected for deletion.
                 self.table.setCellWidget(row, 0, delete_box)
                 self.table.setItem(row, 1, QTableWidgetItem(str(group_index)))
                 self.table.setItem(row, 2, QTableWidgetItem(info.path.name))
@@ -293,10 +352,7 @@ class MainWindow(QMainWindow):
 
     def _groups_without_keeper(self, selected_paths: list[Path]) -> list[list[VideoInfo]]:
         selected = set(selected_paths)
-        return [
-            group for group in self.groups
-            if group and all(info.path in selected for info in group)
-        ]
+        return [group for group in self.groups if group and all(info.path in selected for info in group)]
 
     def delete_selected(self) -> None:
         paths = self.selected_paths()
